@@ -82,16 +82,22 @@ jobs:
           name: bin-linux-${{ matrix.goarch }}
           path: dist/artex-linux-${{ matrix.goarch }}/artex
 
-  # ③ 多架构镜像 → 推 GHCR（复用 binaries 编好的 Linux 二进制，
-  #    基础镜像来自 GHCR 内的副本，构建全程不碰 Docker Hub / ECR）
+  # ③ 多架构镜像 → 推 GHCR
+  #    刻意不用 buildx 的 docker-container builder，也不拉 tonistiigi/binfmt：
+  #    两者都只能从 Docker Hub 匿名拉取，在 runner 共享 IP 下必撞限流。
+  #    改用 runner 自带 dockerd 的内置 BuildKit 分架构构建，再用 docker manifest 合并。
   docker:
     needs: binaries
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
+    env:
+      DOCKER_BUILDKIT: "1"
+      DOCKER_CLI_EXPERIMENTAL: "enabled"   # docker manifest 子命令
     steps:
-      - uses: actions/checkout@v4            # 取 Dockerfile 与 skills/
+      - uses: actions/checkout@v4              # 取 Dockerfile 与 skills/
       - uses: actions/download-artifact@v4
         with:
           name: bin-linux-amd64
@@ -101,13 +107,13 @@ jobs:
           name: bin-linux-arm64
           path: dist/arm64
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-
       # GHCR 镜像名必须全小写，owner 可能大写（Autumn27 → autumn27）
       - name: Resolve lowercase namespace
         id: ns
-        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+          echo "image=${REGISTRY}/$owner/artex" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -116,13 +122,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 基础镜像没搬过就早点报错，别等 build 阶段才炸
+      # arm64 的 RUN apt-get 需要 binfmt。用发行版自带的 qemu-user-static 注册，
+      # 走 archive.ubuntu.com，与容器镜像仓库无关。runner 上多数已预注册。
+      - name: Ensure arm64 binfmt
+        run: |
+          set -euo pipefail
+          if [ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            echo "qemu-aarch64 already registered"
+          else
+            sudo mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq qemu-user-static binfmt-support
+            sudo update-binfmts --enable qemu-aarch64 || true
+          fi
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64
+
       - name: Verify base image exists in GHCR
         env:
           BASE_IMAGE: ${{ env.REGISTRY }}/${{ steps.ns.outputs.owner }}/base/python:${{ env.BASE_IMAGE_TAG }}
         run: |
-          docker buildx imagetools inspect "$BASE_IMAGE" \
-            || { echo "::error::缺少 $BASE_IMAGE，先手动跑一次 mirror-base workflow"; exit 1; }
+          docker manifest inspect "$BASE_IMAGE" >/dev/null \
+            || { echo "::error::缺少 $BASE_IMAGE，先手动跑一次 mirror-images workflow"; exit 1; }
 
       - uses: docker/metadata-action@v5
         id: meta
@@ -133,30 +153,58 @@ jobs:
             type=raw,value=latest
             type=sha,prefix=sha-
 
-      - name: Build and push (linux/amd64, linux/arm64)
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            BASE_IMAGE=${{ env.REGISTRY }}/${{ steps.ns.outputs.owner }}/base/python:${{ env.BASE_IMAGE_TAG }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Build per-arch images
+        env:
+          IMAGE: ${{ steps.ns.outputs.image }}
+          BASE_IMAGE: ${{ env.REGISTRY }}/${{ steps.ns.outputs.owner }}/base/python:${{ env.BASE_IMAGE_TAG }}
+        run: |
+          set -euo pipefail
+          for pair in "amd64 linux/amd64" "arm64 linux/arm64"; do
+            set -- $pair
+            arch="$1"; platform="$2"
+            echo "::group::build $arch ($platform)"
+            docker build \
+              --platform "$platform" \
+              --build-arg BASE_IMAGE="$BASE_IMAGE" \
+              -t "$IMAGE:staging-$arch" \
+              .
+            docker push "$IMAGE:staging-$arch"
+            echo "::endgroup::"
+          done
+
+      - name: Assemble and push multi-arch manifests
+        env:
+          IMAGE: ${{ steps.ns.outputs.image }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            docker manifest create "$tag" \
+              --amend "$IMAGE:staging-amd64" \
+              --amend "$IMAGE:staging-arm64"
+            docker manifest push "$tag"
+            echo "pushed $tag"
+          done <<< "$TAGS"
 
       - name: Image summary
+        env:
+          IMAGE: ${{ steps.ns.outputs.image }}
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           {
             echo "### artex image"
             echo ""
-            echo "Registry: \`${{ env.REGISTRY }}/${{ steps.ns.outputs.owner }}/artex\`"
+            echo "Registry: \`$IMAGE\`"
             echo ""
             echo '```'
-            echo "${{ steps.meta.outputs.tags }}"
+            echo "$TAGS"
             echo '```'
             echo ""
-            echo "Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo '```'
+            while IFS= read -r tag; do
+              [ -z "$tag" ] && continue
+              docker manifest inspect "$tag" | sed -n 's/.*"digest": "\([^"]*\)".*/digest: \1/p'
+            done <<< "$TAGS"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
