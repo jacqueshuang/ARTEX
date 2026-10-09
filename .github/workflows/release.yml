@@ -83,9 +83,9 @@ jobs:
           path: dist/artex-linux-${{ matrix.goarch }}/artex
 
   # ③ 多架构镜像 → 推 GHCR
-  #    刻意不用 buildx 的 docker-container builder，也不拉 tonistiigi/binfmt：
-  #    两者都只能从 Docker Hub 匿名拉取，在 runner 共享 IP 下必撞限流。
-  #    改用 runner 自带 dockerd 的内置 BuildKit 分架构构建，再用 docker manifest 合并。
+  #    不启动 buildx 的 docker-container builder，也不拉 tonistiigi/binfmt：
+  #    这两个镜像只有 Docker Hub 一个源，在 runner 共享 IP 下必撞匿名限流。
+  #    基础镜像用多源回退拉取后打成本地短名，构建阶段不再联网取 FROM。
   docker:
     needs: binaries
     runs-on: ubuntu-latest
@@ -122,8 +122,44 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # arm64 的 RUN apt-get 需要 binfmt。用发行版自带的 qemu-user-static 注册，
-      # 走 archive.ubuntu.com，与容器镜像仓库无关。runner 上多数已预注册。
+      # 第一顺位是 GHCR 副本（若你跑过 mirror-images），未命中会自动跳过；
+      # 后两个是免认证公共源，两者限流池互相独立，交替重试命中率远高于单源。
+      - name: Fetch base images (multi-source with backoff)
+        env:
+          GHCR_BASE: ${{ env.REGISTRY }}/${{ steps.ns.outputs.owner }}/base/python:${{ env.BASE_IMAGE_TAG }}
+        run: |
+          set -uo pipefail
+          tag="$BASE_IMAGE_TAG"
+          sources=(
+            "$GHCR_BASE"
+            "public.ecr.aws/docker/library/python:${tag}"
+            "docker.io/library/python:${tag}"
+          )
+          for pair in "amd64 linux/amd64" "arm64 linux/arm64"; do
+            set -- $pair
+            arch="$1"; platform="$2"
+            local_ref="artex-base-python:${arch}-${tag}"
+            ok=0
+            for attempt in 1 2 3 4 5 6; do
+              for src in "${sources[@]}"; do
+                if docker pull --platform "$platform" "$src" >/dev/null 2>&1; then
+                  docker tag "$src" "$local_ref"
+                  echo "base[$arch] <- $src"
+                  ok=1
+                  break
+                fi
+                echo "::warning::pull miss ($platform): $src"
+              done
+              [ "$ok" = 1 ] && break
+              echo "::warning::round $attempt exhausted for $platform, sleeping $((attempt * 20))s"
+              sleep $((attempt * 20))
+            done
+            [ "$ok" = 1 ] || { echo "::error::no source served base image for $platform"; exit 1; }
+          done
+          docker images 'artex-base-python:*'
+
+      # arm64 的 RUN apt-get 需要 binfmt。用发行版自带 qemu-user-static 注册，
+      # 走 archive.ubuntu.com，与容器镜像仓库限流无关。runner 上多数已预注册。
       - name: Ensure arm64 binfmt
         run: |
           set -euo pipefail
@@ -137,13 +173,6 @@ jobs:
           fi
           cat /proc/sys/fs/binfmt_misc/qemu-aarch64
 
-      - name: Verify base image exists in GHCR
-        env:
-          BASE_IMAGE: ${{ env.REGISTRY }}/${{ steps.ns.outputs.owner }}/base/python:${{ env.BASE_IMAGE_TAG }}
-        run: |
-          docker manifest inspect "$BASE_IMAGE" >/dev/null \
-            || { echo "::error::缺少 $BASE_IMAGE，先手动跑一次 mirror-images workflow"; exit 1; }
-
       - uses: docker/metadata-action@v5
         id: meta
         with:
@@ -156,16 +185,16 @@ jobs:
       - name: Build per-arch images
         env:
           IMAGE: ${{ steps.ns.outputs.image }}
-          BASE_IMAGE: ${{ env.REGISTRY }}/${{ steps.ns.outputs.owner }}/base/python:${{ env.BASE_IMAGE_TAG }}
         run: |
           set -euo pipefail
+          tag="$BASE_IMAGE_TAG"
           for pair in "amd64 linux/amd64" "arm64 linux/arm64"; do
             set -- $pair
             arch="$1"; platform="$2"
             echo "::group::build $arch ($platform)"
             docker build \
               --platform "$platform" \
-              --build-arg BASE_IMAGE="$BASE_IMAGE" \
+              --build-arg BASE_IMAGE="artex-base-python:${arch}-${tag}" \
               -t "$IMAGE:staging-$arch" \
               .
             docker push "$IMAGE:staging-$arch"
