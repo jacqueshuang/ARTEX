@@ -10,9 +10,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  # 基础镜像统一从这里取，避开 Docker Hub 匿名限流（429）。
-  # 本地开发时 Dockerfile 自带的默认值就是它，无需登录即可构建。
-  BASE_IMAGE_UPSTREAM: public.ecr.aws/docker/library/python:3.12-slim-bookworm
+  # 基础镜像来源。已登录 Docker Hub 时按账号计额度，不再受 runner 共享 IP 的匿名限流影响。
+  BASE_IMAGE_UPSTREAM: python:3.12-slim-bookworm
 
 jobs:
   # ① 前端静态导出（一次），产物给交叉编译各平台复用
@@ -84,13 +83,16 @@ jobs:
           name: bin-linux-${{ matrix.goarch }}
           path: dist/artex-linux-${{ matrix.goarch }}/artex
 
-  # ③ 把基础镜像镜像到自己的 GHCR，构建阶段完全不碰 Docker Hub。
-  #    幂等：已存在时只是重写 manifest，几秒完成。
+  # ③ 把基础镜像搬到自己的 GHCR：构建阶段从此只跟 ghcr.io 打交道。
+  #    Docker Hub 凭证存在时按账号拉取；带 5 次指数退避，扛住突发限流。
   mirror-base:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
+    env:
+      DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
     outputs:
       image: ${{ steps.ns.outputs.base }}
     steps:
@@ -100,18 +102,37 @@ jobs:
         run: |
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           echo "base=${REGISTRY}/$owner/base/python:3.12-slim-bookworm" >> "$GITHUB_OUTPUT"
-      - uses: docker/login-action@v3
+      # 没有配置 Docker Hub secret 时自动跳过，退化为匿名拉取 + 重试
+      - name: Log in to Docker Hub
+        if: env.DH_USER != ''
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Copy python base image into GHCR
+      - name: Mirror python base image into GHCR
         env:
           BASE_IMAGE_TARGET: ${{ steps.ns.outputs.base }}
         run: |
-          docker buildx imagetools create \
-            --tag "$BASE_IMAGE_TARGET" \
-            "$BASE_IMAGE_UPSTREAM"
+          set -uo pipefail
+          for i in 1 2 3 4 5; do
+            if docker buildx imagetools create \
+                 --tag "$BASE_IMAGE_TARGET" \
+                 "$BASE_IMAGE_UPSTREAM"; then
+              echo "mirrored: $BASE_IMAGE_UPSTREAM -> $BASE_IMAGE_TARGET"
+              exit 0
+            fi
+            echo "::warning::mirror attempt $i failed, backing off $((i * 20))s"
+            sleep $((i * 20))
+          done
+          echo "::error::mirror failed after 5 attempts"
+          exit 1
       - name: Show copied image
         run: docker buildx imagetools inspect "${{ steps.ns.outputs.base }}"
 
@@ -147,7 +168,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}   # 免密，不再用 DOCKERHUB_*
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/metadata-action@v5
         id: meta
@@ -167,6 +188,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 基础镜像来自 GHCR 的镜像副本，构建全程不碰 Docker Hub
           build-args: |
             BASE_IMAGE=${{ needs.mirror-base.outputs.image }}
           cache-from: type=gha
