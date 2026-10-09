@@ -6,10 +6,13 @@ on:
 
 permissions:
   contents: write   # 创建 Release 需要
-  packages: write   # 推 ghcr.io 镜像需要（显式声明后未列出的权限为 none）
+  packages: write   # 推 ghcr.io 镜像需要
 
 env:
   REGISTRY: ghcr.io
+  # 基础镜像统一从这里取，避开 Docker Hub 匿名限流（429）。
+  # 本地开发时 Dockerfile 自带的默认值就是它，无需登录即可构建。
+  BASE_IMAGE_UPSTREAM: public.ecr.aws/docker/library/python:3.12-slim-bookworm
 
 jobs:
   # ① 前端静态导出（一次），产物给交叉编译各平台复用
@@ -60,6 +63,8 @@ jobs:
           ARTEX_BUILD_VERSION: ${{ github.ref_name }}
           ARTEX_SKIP_FRONTEND: "1"
           ARTEX_SKIP_NPM_CI: "1"
+          # UPX 自解压 ELF 在部分 Linux 内核、虚拟化和安全策略下会崩溃。
+          # Release 使用 Go linker 裁剪和 zip 压缩，优先保证可移植性。
           ARTEX_COMPRESS: "0"
           ARTEX_PACKAGE: "1"
           ARTEX_PACKAGE_DIR: dist
@@ -72,21 +77,54 @@ jobs:
         with:
           name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
           path: "dist/*.zip"
+      # Linux 生二进制单独上传，供 docker job 复用（免在镜像里重编前端+Go）
       - if: matrix.goos == 'linux'
         uses: actions/upload-artifact@v4
         with:
           name: bin-linux-${{ matrix.goarch }}
           path: dist/artex-linux-${{ matrix.goarch }}/artex
 
-  # ③ 多架构镜像 → 推 GitHub Container Registry（GHCR）
+  # ③ 把基础镜像镜像到自己的 GHCR，构建阶段完全不碰 Docker Hub。
+  #    幂等：已存在时只是重写 manifest，几秒完成。
+  mirror-base:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ns.outputs.base }}
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - name: Resolve lowercase namespace
+        id: ns
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "base=${REGISTRY}/$owner/base/python:3.12-slim-bookworm" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Copy python base image into GHCR
+        env:
+          BASE_IMAGE_TARGET: ${{ steps.ns.outputs.base }}
+        run: |
+          docker buildx imagetools create \
+            --tag "$BASE_IMAGE_TARGET" \
+            "$BASE_IMAGE_UPSTREAM"
+      - name: Show copied image
+        run: docker buildx imagetools inspect "${{ steps.ns.outputs.base }}"
+
+  # ④ 多架构镜像 → 推 GHCR（复用 binaries 编好的 Linux 二进制，
+  #    镜像里只装工具 + 放二进制；arm64 仅需模拟 apt 层，构建快很多）
   docker:
-    needs: binaries
+    needs: [binaries, mirror-base]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4            # 取 Dockerfile 与 skills/
       - uses: actions/download-artifact@v4
         with:
           name: bin-linux-amd64
@@ -99,8 +137,8 @@ jobs:
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
-      # GHCR 镜像名必须全小写，owner 可能是大写（Autumn27 → autumn27）
-      - name: Lowercase image namespace
+      # GHCR 镜像名必须全小写，owner 可能大写（Autumn27 → autumn27）
+      - name: Resolve lowercase namespace
         id: ns
         run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
@@ -129,6 +167,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BASE_IMAGE=${{ needs.mirror-base.outputs.image }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
