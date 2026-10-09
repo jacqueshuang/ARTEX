@@ -85,7 +85,7 @@ jobs:
   # ③ 多架构镜像 → 推 GHCR
   #    不启动 buildx 的 docker-container builder，也不拉 tonistiigi/binfmt：
   #    这两个镜像只有 Docker Hub 一个源，在 runner 共享 IP 下必撞匿名限流。
-  #    基础镜像用多源回退拉取后打成本地短名，构建阶段不再联网取 FROM。
+  #    基础镜像多源回退拉取后打成本地短名，构建阶段不再联网取 FROM。
   docker:
     needs: binaries
     runs-on: ubuntu-latest
@@ -121,6 +121,23 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 提前拦住所有会打到 Docker Hub 的隐性依赖，别让 build 阶段才炸
+      - name: Audit Dockerfile for external registry dependencies
+        run: |
+          set -uo pipefail
+          rc=0
+          if grep -nE '^#\s*syntax=.*(docker\.io|docker/dockerfile)' Dockerfile; then
+            echo "::error::Dockerfile 的 # syntax 指向 Docker Hub，删掉该行用内置前端"
+            rc=1
+          fi
+          echo "--- FROM / COPY --from 清单（应全部为本地短名或 ghcr.io）---"
+          grep -nE '^\s*(FROM|COPY\s+--from=)' Dockerfile || true
+          if grep -nE '^\s*(FROM|COPY\s+--from=).*(docker\.io|(?<!--)library/[a-z])' Dockerfile; then
+            echo "::error::存在指向 Docker Hub 的镜像引用"
+            rc=1
+          fi
+          exit $rc
 
       # 第一顺位是 GHCR 副本（若你跑过 mirror-images），未命中会自动跳过；
       # 后两个是免认证公共源，两者限流池互相独立，交替重试命中率远高于单源。
