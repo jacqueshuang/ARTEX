@@ -10,7 +10,8 @@
 #   cp -r web/out server/webui/dist
 #   CGO_ENABLED=0 GOARCH=amd64 go build -tags embedui -o dist/amd64/artex ./cmd/artex
 #   docker build -t artex:local .
-FROM python:3.12-slim-bookworm
+ARG BASE_IMAGE=public.ecr.aws/docker/library/python:3.12-slim-bookworm
+FROM ${BASE_IMAGE}
 ARG TARGETARCH
 # 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
 # Node 从 NodeSource 装 20.x：bookworm 自带的 apt nodejs 是 18，Playwright 要求 >=20。
