@@ -78,24 +78,24 @@ jobs:
           path: dist/artex-linux-${{ matrix.goarch }}/artex
 
   # ③ 汇总所有 zip → 创建 GitHub Release
-  release:
-    needs: binaries
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: pkg-*
-          merge-multiple: true
-          path: dist
-      - name: Generate checksums
-        working-directory: dist
-        run: sha256sum *.zip > SHA256SUMS
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.zip
-            dist/SHA256SUMS
-          generate_release_notes: true
+  # release:
+  #   needs: binaries
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/download-artifact@v4
+  #       with:
+  #         pattern: pkg-*
+  #         merge-multiple: true
+  #         path: dist
+  #     - name: Generate checksums
+  #       working-directory: dist
+  #       run: sha256sum *.zip > SHA256SUMS
+  #     - uses: softprops/action-gh-release@v2
+  #       with:
+  #         files: |
+  #           dist/*.zip
+  #           dist/SHA256SUMS
+  #         generate_release_notes: true
 
   # ④ 多架构镜像 → 推 Docker Hub（复用 binaries 编好的 Linux 二进制，
   #    镜像里只装工具 + 放二进制；arm64 仅需模拟 apt 层，构建快很多）
